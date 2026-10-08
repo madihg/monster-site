@@ -11,26 +11,100 @@ interface Message {
   isFloating?: boolean;
 }
 
-export default function Home() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: 'system',
-      content:
-        'Whomp is a witty French poet whose writing is a mix of Ocean Vuong and Charles Bernstein',
-      id: 'system-prompt',
+// The system line. Leave NEXT_PUBLIC_MONSTER_SYSTEM unset and the studio adds
+// your monster's own system line for you.
+const SYSTEM_LINE = (process.env.NEXT_PUBLIC_MONSTER_SYSTEM || '').trim();
+
+// Shown while the monster wakes up. The first message after a quiet spell can
+// take a minute or two.
+const WAITING_LINES = [
+  'the prophet is breathing',
+  'a machine is praying',
+  'wait for the living algorithm',
+];
+
+function toApiMessages(list: Message[]) {
+  const turns = list.map((msg) => ({ role: msg.role, content: msg.content }));
+  return SYSTEM_LINE ? [{ role: 'system', content: SYSTEM_LINE }, ...turns] : turns;
+}
+
+// One server-sent event: its name (null for a token) and its data.
+function readEvent(block: string): { event: string | null; data: string } {
+  let event: string | null = null;
+  const data: string[] = [];
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+  }
+  return { event, data: data.join('\n') };
+}
+
+// Sends the conversation to /api/chat and reads the stream: tokens as they
+// arrive, a "waking" event while the monster wakes up, an error if it breaks.
+async function streamReply(
+  history: Message[],
+  onToken: (text: string) => void,
+  onWaking: () => void
+): Promise<string> {
+  const response = await fetch('/api/chat', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
     },
-  ]);
+    body: JSON.stringify({ messages: toApiMessages(history) }),
+  });
+
+  if (!response.ok || !response.body) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.error || 'Failed to get response');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let reply = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let match = /\r?\n\r?\n/.exec(buffer);
+    while (match) {
+      const { event, data } = readEvent(buffer.slice(0, match.index));
+      buffer = buffer.slice(match.index + match[0].length);
+      match = /\r?\n\r?\n/.exec(buffer);
+      if (!data) continue; // a heartbeat while the monster wakes up
+      if (data.trim() === '[DONE]') return reply;
+      if (event === 'waking') {
+        onWaking();
+        continue;
+      }
+      const parsed = JSON.parse(data);
+      if (event === 'error' || parsed.error) {
+        throw new Error(parsed.error?.message || 'The monster stopped answering');
+      }
+      const text = parsed.choices?.[0]?.delta?.content;
+      if (typeof text === 'string' && text.length > 0) {
+        reply += text;
+        onToken(text);
+      }
+    }
+  }
+  return reply;
+}
+
+export default function Home() {
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
-  const [isRecording, setIsRecording] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [isWaking, setIsWaking] = useState(false);
+  const [waitingLine, setWaitingLine] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [speakReplies, setSpeakReplies] = useState(false);
   const [continuousListening, setContinuousListening] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
+  const [speechSupported, setSpeechSupported] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const recognitionRef = useRef<any>(null);
   const continuousListeningRef = useRef(continuousListening);
   const messagesRef = useRef(messages);
@@ -52,12 +126,58 @@ export default function Home() {
     messagesRef.current = messages;
   }, [messages]);
 
+  // Cycle the waiting lines while the monster wakes up
+  useEffect(() => {
+    if (!isWaking) return;
+    const timer = setInterval(() => {
+      setWaitingLine((i) => (i + 1) % WAITING_LINES.length);
+    }, 2500);
+    return () => clearInterval(timer);
+  }, [isWaking]);
+
+  // Ask the monster and show its answer token by token as it streams in
+  const askMonster = async (history: Message[]): Promise<string> => {
+    const id = `assistant-${Date.now()}`;
+    let started = false;
+    setIsStreaming(false);
+    setIsWaking(false);
+    try {
+      return await streamReply(
+        history,
+        (text) => {
+          if (!started) {
+            started = true;
+            setIsWaking(false);
+            setIsStreaming(true);
+            setMessages((prev) => [
+              ...prev,
+              { role: 'assistant', content: text, timestamp: Date.now(), id },
+            ]);
+          } else {
+            setMessages((prev) =>
+              prev.map((msg) => (msg.id === id ? { ...msg, content: msg.content + text } : msg))
+            );
+          }
+        },
+        () => {
+          setWaitingLine(0);
+          setIsWaking(true);
+        }
+      );
+    } finally {
+      setIsWaking(false);
+      setIsStreaming(false);
+    }
+  };
+
+  const errorText = (error: unknown) =>
+    error instanceof Error && error.message
+      ? `Sorry, I encountered an error. ${error.message}`
+      : 'Sorry, I encountered an error. Please try again.';
+
   // Handle auto-submit from speech recognition with fresh state
   const handleAutoSubmit = async (text: string) => {
     if (!text.trim() || isLoading) return;
-
-    console.log('handleAutoSubmit called with:', text);
-    console.log('Current continuous listening:', continuousListeningRef.current);
 
     const userMessage: Message = {
       role: 'user',
@@ -72,41 +192,12 @@ export default function Home() {
     setIsLoading(true);
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          messages: [...messagesRef.current, userMessage].map((msg) => ({
-            role: msg.role,
-            content: msg.content,
-          })),
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to get response');
-      }
-
-      const assistantMessage = await response.json();
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: assistantMessage.content,
-          timestamp: Date.now(),
-          id: `assistant-${Date.now()}`,
-        },
-      ]);
-
+      const reply = await askMonster([...messagesRef.current, userMessage]);
       // ALWAYS auto-speak when called from speech recognition
-      console.log('Auto-speaking response:', assistantMessage.content);
-      await speakText(assistantMessage.content);
+      speakText(reply);
     } catch (error) {
       console.error('Error getting completion:', error);
-      const errorMsg = 'Sorry, I encountered an error. Please try again.';
+      const errorMsg = errorText(error);
       setMessages((prev) => [
         ...prev,
         {
@@ -116,8 +207,8 @@ export default function Home() {
           id: `error-${Date.now()}`,
         },
       ]);
-      
-      await speakText(errorMsg);
+
+      speakText(errorMsg);
     } finally {
       setIsLoading(false);
     }
@@ -134,18 +225,15 @@ export default function Home() {
         recognition.lang = 'en-US';
 
         recognition.onstart = () => {
-          console.log('Speech recognition started');
           setIsListening(true);
         };
 
         recognition.onresult = (event: any) => {
-          console.log('Speech result received:', event.results);
           let interimTranscript = '';
           let finalTranscript = '';
 
           for (let i = event.resultIndex; i < event.results.length; i++) {
             const transcript = event.results[i][0].transcript;
-            console.log(`Result ${i}: ${transcript}, isFinal: ${event.results[i].isFinal}`);
             if (event.results[i].isFinal) {
               finalTranscript += transcript + ' ';
             } else {
@@ -155,24 +243,24 @@ export default function Home() {
 
           // Show live transcription in input box
           if (interimTranscript) {
-            console.log('Setting interim transcript:', interimTranscript);
             setInput(interimTranscript);
           }
 
           // When we get a final result (after silence), auto-submit
           if (finalTranscript) {
             const fullText = finalTranscript.trim();
-            console.log('Final transcript received:', fullText);
-            console.log('Continuous listening ref:', continuousListeningRef.current);
             if (fullText && continuousListeningRef.current) {
               setInput(fullText);
               // Stop listening while we process
               recognition.stop();
               // Auto-submit after a brief delay
               setTimeout(() => {
-                console.log('Auto-submitting message:', fullText);
                 handleAutoSubmit(fullText);
               }, 500);
+            } else if (fullText) {
+              // Push to talk: put the words in the box, you press send
+              setInput(fullText);
+              recognition.stop();
             }
           }
         };
@@ -183,15 +271,12 @@ export default function Home() {
         };
 
         recognition.onend = () => {
-          console.log('Speech recognition ended');
           setIsListening(false);
         };
 
         recognitionRef.current = recognition;
-        console.log('Speech recognition initialized');
       } else {
-        console.error('Speech Recognition not supported in this browser');
-        alert('Speech Recognition is not supported in this browser. Please use Chrome or Edge.');
+        setSpeechSupported(false);
       }
     }
 
@@ -209,7 +294,6 @@ export default function Home() {
   const startSpeechRecognition = () => {
     if (recognitionRef.current && !isListening) {
       try {
-        console.log('Starting speech recognition...');
         recognitionRef.current.start();
       } catch (e) {
         console.log('Recognition already started or error:', e);
@@ -220,7 +304,6 @@ export default function Home() {
   const stopSpeechRecognition = () => {
     if (recognitionRef.current) {
       try {
-        console.log('Stopping speech recognition...');
         recognitionRef.current.stop();
         setIsListening(false);
       } catch (e) {
@@ -232,7 +315,6 @@ export default function Home() {
   // Handle continuous listening restart after speech ends or AI finishes speaking
   useEffect(() => {
     if (continuousListening && !isSpeaking && !isListening && !isLoading) {
-      console.log('Restarting speech recognition for continuous mode');
       const timer = setTimeout(() => {
         startSpeechRecognition();
       }, 500);
@@ -240,192 +322,28 @@ export default function Home() {
     }
   }, [continuousListening, isSpeaking, isListening, isLoading]);
 
-  const startRecording = async () => {
-    try {
-      // If we already have a stream in continuous mode, just start a new recording
-      if (continuousListening && streamRef.current) {
-        const mediaRecorder = new MediaRecorder(streamRef.current);
-        mediaRecorderRef.current = mediaRecorder;
-        chunksRef.current = [];
+  // Speak a reply with the browser's own voice (Web Speech API)
+  const speakText = (text: string) => {
+    if (!text.trim() || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
 
-        mediaRecorder.ondataavailable = (e) => {
-          chunksRef.current.push(e.data);
-        };
+    // Stop speech recognition while AI is speaking
+    stopSpeechRecognition();
+    window.speechSynthesis.cancel();
 
-        mediaRecorder.onstop = async () => {
-          const audioBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
-          await transcribeAudio(audioBlob);
-          
-          // In continuous mode, restart recording after transcription (unless speaking)
-          if (continuousListening && !isSpeaking) {
-            setTimeout(() => startRecording(), 100);
-          }
-        };
-
-        mediaRecorder.start();
-        setIsRecording(true);
-        return;
-      }
-
-      // Initial setup - get the stream
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      chunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (e) => {
-        chunksRef.current.push(e.data);
-      };
-
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
-        await transcribeAudio(audioBlob);
-        
-        // In continuous mode, restart recording after transcription (unless speaking)
-        if (continuousListening && !isSpeaking) {
-          setTimeout(() => startRecording(), 100);
-        } else if (!continuousListening) {
-          // Clean up stream if not in continuous mode
-          stream.getTracks().forEach((track) => track.stop());
-          streamRef.current = null;
-        }
-      };
-
-      mediaRecorder.start();
-      setIsRecording(true);
-    } catch (error) {
-      console.error('Error accessing microphone:', error);
-    }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-    }
-  };
-
-  const stopMicrophone = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-  };
-
-  const transcribeAudio = async (audioBlob: Blob) => {
-    try {
-      setIsLoading(true);
-      const formData = new FormData();
-      const file = new File([audioBlob], 'audio.webm', { type: 'audio/webm' });
-      formData.append('file', file);
-
-      const response = await fetch('/api/speech', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to transcribe audio');
-      }
-
-      const data = await response.json();
-      setInput(data.text);
-    } catch (error: any) {
-      console.error('Error transcribing audio:', error);
-      alert(error.message || 'Failed to transcribe audio');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const speakText = async (text: string) => {
-    try {
-      console.log('Sending text to speech API:', text);
-
-      // Stop speech recognition while AI is speaking
-      if (isListening) {
-        stopSpeechRecognition();
-      }
-      // Also stop recording if using mic button
-      if (isRecording) {
-        stopRecording();
-      }
-      setIsSpeaking(true);
-
-      const response = await fetch('/api/speech', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ text }),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        console.error('Error response from speech API:', response.status, errorData);
-        throw new Error(errorData.error || `Failed to generate speech: ${response.status}`);
-      }
-
-      const contentType = response.headers.get('Content-Type');
-      console.log('Response content type:', contentType);
-
-      if (!contentType || !contentType.includes('audio/mpeg')) {
-        const errorData = await response.json().catch(() => ({}));
-        console.error('Invalid response format:', errorData);
-        throw new Error(errorData.error || 'Response was not audio format');
-      }
-
-      const audioBlob = await response.blob();
-
-      if (audioBlob.size === 0) {
-        console.error('Empty audio blob received');
-        throw new Error('Empty audio received from API');
-      }
-
-      console.log('Audio blob received, size:', audioBlob.size);
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl);
-      audioRef.current = audio;
-
-      audio.onerror = (e) => {
-        console.error('Error playing audio:', e);
-        setIsSpeaking(false);
-        // Resume speech recognition if in continuous mode
-        if (continuousListeningRef.current) {
-          console.log('Resuming speech recognition after audio error');
-          setTimeout(() => startSpeechRecognition(), 100);
-        }
-      };
-
-      audio.onended = () => {
-        console.log('Audio playback ended');
-        setIsSpeaking(false);
-        // Resume speech recognition after AI finishes speaking
-        if (continuousListeningRef.current) {
-          console.log('Resuming speech recognition after audio ended');
-          setTimeout(() => startSpeechRecognition(), 500);
-        }
-      };
-
-      console.log('Starting audio playback...');
-      await audio.play();
-      console.log('Audio playback started');
-    } catch (error: any) {
-      console.error('Error generating speech:', error);
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'en-US';
+    const finish = () => {
       setIsSpeaking(false);
-      // Resume speech recognition if in continuous mode even on error
+      // Resume speech recognition after AI finishes speaking
       if (continuousListeningRef.current) {
-        setTimeout(() => startSpeechRecognition(), 100);
+        setTimeout(() => startSpeechRecognition(), 500);
       }
-      alert(error.message || 'Failed to generate speech');
-    }
+    };
+    utterance.onend = finish;
+    utterance.onerror = finish;
+
+    setIsSpeaking(true);
+    window.speechSynthesis.speak(utterance);
   };
 
   const submitMessage = async (text: string) => {
@@ -444,44 +362,15 @@ export default function Home() {
     setIsLoading(true);
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          messages: [...messages, userMessage].map((msg) => ({
-            role: msg.role,
-            content: msg.content,
-          })),
-        }),
-      });
+      const reply = await askMonster([...messages, userMessage]);
 
-      if (!response.ok) {
-        throw new Error('Failed to get response');
-      }
-
-      const assistantMessage = await response.json();
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: assistantMessage.content,
-          timestamp: Date.now(),
-          id: `assistant-${Date.now()}`,
-        },
-      ]);
-
-      // Auto-speak the response in continuous listening mode
-      console.log('Continuous listening:', continuousListening, 'Content:', assistantMessage.content);
-      if (continuousListening) {
-        console.log('Auto-speaking the response...');
-        await speakText(assistantMessage.content);
+      // Speak the response when Speak replies is on, and in continuous listening mode
+      if (continuousListening || speakReplies) {
+        speakText(reply);
       }
     } catch (error) {
       console.error('Error getting completion:', error);
-      const errorMsg = 'Sorry, I encountered an error. Please try again.';
+      const errorMsg = errorText(error);
       setMessages((prev) => [
         ...prev,
         {
@@ -491,10 +380,10 @@ export default function Home() {
           id: `error-${Date.now()}`,
         },
       ]);
-      
+
       // Also speak error message in continuous mode
       if (continuousListening) {
-        await speakText(errorMsg);
+        speakText(errorMsg);
       }
     } finally {
       setIsLoading(false);
@@ -512,17 +401,17 @@ export default function Home() {
         <div className="bg-white border-4 border-black">
           <div className="h-[700px] flex flex-col">
             <div className="p-3 bg-white border-b-4 border-black">
-              <div className="flex justify-between items-center">
+              <div className="flex flex-wrap justify-between items-center gap-2">
                 <div>
                   <h1 className="text-3xl font-bold text-black" style={{ fontFamily: '"Times New Roman", Times, serif' }}>
-                    AI POET CHAT
+                    MONSTER CHAT
                   </h1>
                   <p className="text-sm text-black mt-1" style={{ fontFamily: '"Times New Roman", Times, serif' }}>
-                    Chat with Whomp, the French AI poet
+                    Talk to my monster
                   </p>
                 </div>
-                <div className="flex items-center space-x-3">
-                  <label className={`flex items-center space-x-2 ${isSpeaking ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className={`flex items-center space-x-2 ${isSpeaking || !speechSupported ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}>
                     <span className="text-xs text-black font-mono uppercase tracking-wider">Continuous Listen</span>
                     <button
                       onClick={async () => {
@@ -531,7 +420,6 @@ export default function Home() {
                         if (newValue) {
                           try {
                             await navigator.mediaDevices.getUserMedia({ audio: true });
-                            console.log('Microphone permission granted');
                             setContinuousListening(true);
                             startSpeechRecognition();
                           } catch (error) {
@@ -544,12 +432,33 @@ export default function Home() {
                           setInput('');
                         }
                       }}
-                      disabled={isSpeaking}
+                      disabled={isSpeaking || !speechSupported}
                       className={`border-2 border-black px-3 py-1 text-xs font-mono transition-colors ${
                         continuousListening ? 'bg-black text-white' : 'bg-white text-black'
                       } ${isSpeaking ? 'opacity-50 cursor-not-allowed' : 'hover:opacity-80'}`}
                     >
                       {continuousListening ? 'ON' : 'OFF'}
+                    </button>
+                  </label>
+                  <label className="flex items-center space-x-2 cursor-pointer">
+                    <span className="text-xs text-black font-mono uppercase tracking-wider">Speak Replies</span>
+                    <button
+                      onClick={() => {
+                        const newValue = !speakReplies;
+                        setSpeakReplies(newValue);
+                        if (newValue && 'speechSynthesis' in window) {
+                          // Phones only speak after a tap: this empty line unlocks the voice
+                          window.speechSynthesis.speak(new SpeechSynthesisUtterance(''));
+                        } else if (!newValue && 'speechSynthesis' in window) {
+                          window.speechSynthesis.cancel();
+                          setIsSpeaking(false);
+                        }
+                      }}
+                      className={`border-2 border-black px-3 py-1 text-xs font-mono transition-colors hover:opacity-80 ${
+                        speakReplies ? 'bg-black text-white' : 'bg-white text-black'
+                      }`}
+                    >
+                      {speakReplies ? 'ON' : 'OFF'}
                     </button>
                   </label>
                   {isListening && !isSpeaking && (
@@ -574,7 +483,7 @@ export default function Home() {
             </div>
 
             <div className="flex-1 overflow-y-auto p-3 space-y-4 bg-white">
-              {messages.slice(1).map((message) => (
+              {messages.map((message) => (
                 <div
                   key={message.id}
                   className={`flex items-start space-x-2 ${
@@ -631,17 +540,23 @@ export default function Home() {
                 </div>
               ))}
 
-              {isLoading && (
+              {isLoading && !isStreaming && (
                 <div className="flex justify-start items-center space-x-2">
                   <div className="w-8 h-8 border-2 border-black bg-white flex items-center justify-center">
                     <Bot size={18} className="text-black" />
                   </div>
                   <div className="bg-white border-2 border-black p-3">
-                    <div className="flex space-x-2">
-                      <div className="w-2 h-2 bg-black animate-bounce" style={{ animationDelay: '0ms' }}></div>
-                      <div className="w-2 h-2 bg-black animate-bounce" style={{ animationDelay: '150ms' }}></div>
-                      <div className="w-2 h-2 bg-black animate-bounce" style={{ animationDelay: '300ms' }}></div>
-                    </div>
+                    {isWaking ? (
+                      <p className="text-sm text-black italic" aria-live="polite">
+                        {WAITING_LINES[waitingLine]}
+                      </p>
+                    ) : (
+                      <div className="flex space-x-2">
+                        <div className="w-2 h-2 bg-black animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                        <div className="w-2 h-2 bg-black animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                        <div className="w-2 h-2 bg-black animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
@@ -655,7 +570,7 @@ export default function Home() {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   placeholder={isListening ? ">>> LISTENING... SPEAK NOW" : "Type your message..."}
-                  className={`flex-1 p-2 border-2 border-black focus:outline-none transition-all text-sm ${
+                  className={`flex-1 min-w-0 p-2 border-2 border-black focus:outline-none transition-all text-sm ${
                     isListening ? 'bg-black text-white placeholder-white font-mono' : 'bg-white text-black'
                   }`}
                   style={{ fontFamily: isListening ? 'monospace' : '"Times New Roman", Times, serif' }}
@@ -664,16 +579,22 @@ export default function Home() {
                 />
                 <button
                   type="button"
-                  onClick={isRecording ? stopRecording : startRecording}
+                  onClick={isListening ? stopSpeechRecognition : startSpeechRecognition}
                   className={`p-2 border-2 border-black transition-colors ${
-                    isRecording
+                    isListening && !continuousListening
                       ? 'bg-black text-white animate-pulse'
                       : 'bg-white text-black hover:opacity-60'
                   }`}
-                  disabled={isLoading || continuousListening}
-                  title={continuousListening ? 'Mic is auto-managed in continuous mode' : 'Push to talk'}
+                  disabled={isLoading || continuousListening || !speechSupported}
+                  title={
+                    !speechSupported
+                      ? 'Speaking to the monster works in Chrome, Edge and Safari'
+                      : continuousListening
+                        ? 'Mic is auto-managed in continuous mode'
+                        : 'Push to talk'
+                  }
                 >
-                  {isRecording ? <Square size={18} /> : <Mic size={18} />}
+                  {isListening && !continuousListening ? <Square size={18} /> : <Mic size={18} />}
                 </button>
                 <button
                   type="submit"
